@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Include cudaMath before mathUtils to avoid MSVC overload ambiguity (dot/cross for float3)
+#include <3dgut/kernels/cuda/common/cudaMath.cuh>
 #include <3dgut/kernels/cuda/common/mathUtils.cuh>
 
 namespace threedgut {
@@ -595,8 +597,8 @@ __device__ inline void processHitBwd(
         // >>> rayRadiance = accumulatedRayRad + weigth * rayRad + (1-galpha)*transmit * residualRayRad
         const float3 rayRad = weight * grad;
         radiance += rayRad;
-        const float3 residualRayRad = maxf3((nextTransmit <= minTransmittance ? make_float3(0) : (integratedRadiance - radiance) / nextTransmit),
-                                            make_float3(0));
+        const float3 residualRayRad = maxf3((nextTransmit <= minTransmittance ? make_float3(0.0f, 0.0f, 0.0f) : (integratedRadiance - radiance) / nextTransmit),
+                                            make_float3(0.0f, 0.0f, 0.0f));
 
         // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         // ---> rayDns = 1 - prevTrm * (1-galpha) * nextTrm

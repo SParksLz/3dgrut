@@ -107,7 +107,11 @@ static inline __device__ bool projectPoint(const OpenCVFisheyeProjectionParamete
                                            const tcnn::vec3& position,
                                            float tolerance,
                                            tcnn::vec2& projected) {
+#if defined(_MSC_VER)
+    constexpr float eps   = 1.19209290e-7f;  // FLT_EPSILON, __FLT_EPSILON__ not defined on MSVC
+#else
     constexpr float eps   = __FLT_EPSILON__;
+#endif
     const float rho       = fmaxf(tcnn::length(position.xy()), eps);
     const float thetaFull = atan2f(rho, position.z);
     // Limit angles to max_angle to prevent projected points to leave valid cone around max_angle.

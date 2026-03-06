@@ -430,7 +430,7 @@ static __device__ inline float3 safe_normalize_bw(const float3& v, const float3&
                                               d_out.x * (v.x * v.y) + d_out.y * (v.y * v.y) + d_out.z * (v.z * v.y),
                                               d_out.x * (v.x * v.z) + d_out.y * (v.y * v.z) + d_out.z * (v.z * v.z));
     }
-    return make_float3(0);
+    return make_float3(0.0f, 0.0f, 0.0f);
 }
 
 static __device__ __inline__ float sqr(const float x) {

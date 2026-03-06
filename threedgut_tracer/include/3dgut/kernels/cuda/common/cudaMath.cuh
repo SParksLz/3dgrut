@@ -170,6 +170,7 @@ inline __host__ __device__ float3 hadamard_product(const float3& a, const float3
 inline __host__ __device__ float3 cross(const float3& a, const float3& b) {
     return make_float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
 }
+#define THREEDGUT_CUDAMATH_DOT_CROSS_DEFINED
 
 // ===============================================================
 // Return the dot product of two float2s
