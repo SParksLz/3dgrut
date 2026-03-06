@@ -72,6 +72,23 @@ Write-Host "Creating conda environment..."
 conda create -n $CondaEnv python=3.11 -y
 Check-LastCommand "Conda environment creation"
 
+# Load conda PowerShell hook so "conda activate" works in this process (required when script is run with -NoProfile)
+$condaRoot = $null
+try {
+    $condaExe = (Get-Command conda -ErrorAction Stop).Source
+    if ($condaExe) { $condaRoot = Split-Path (Split-Path $condaExe -Parent) -Parent }
+} catch {}
+if (-not $condaRoot) {
+    $baseOut = & conda info --base 2>$null
+    if ($baseOut) { $condaRoot = ($baseOut | Select-Object -First 1).Trim() }
+}
+if ($condaRoot) {
+    $condaHook = Join-Path $condaRoot "shell\condabin\conda-hook.ps1"
+    if (Test-Path $condaHook) {
+        . $condaHook
+    }
+}
+
 Write-Host "Activating conda environment..."
 conda activate $CondaEnv
 Check-LastCommand "Conda environment activation"
@@ -85,33 +102,26 @@ if ($CurrentEnv -ne $CondaEnv) {
 Write-Host "Current environment: $CurrentEnv" -ForegroundColor Green
 
 # Configure Visual Studio C++ compiler for PyTorch JIT compilation
+# Use activate.d hook to PREPEND VS path to PATH (preserves your existing PATH)
 Write-Host "`nConfiguring Visual Studio C++ compiler for conda environment..." -ForegroundColor Yellow
 $vsCompilerPath = Find-VisualStudioCompiler
 if ($vsCompilerPath) {
-    # Get current PATH from conda environment
-    $currentPath = conda env config vars list -n $CondaEnv | Select-String "PATH" | ForEach-Object { $_.ToString().Split('=', 2)[1] }
-    
-    if ($currentPath) {
-        # Append to existing PATH
-        $newPath = "$vsCompilerPath;$currentPath"
-    } else {
-        # Create new PATH with VS compiler and current system PATH
-        $newPath = "$vsCompilerPath;$env:PATH"
-    }
-    
-    # Set the PATH environment variable for this conda environment
-    conda env config vars set -n $CondaEnv "PATH=$newPath"
-    Check-LastCommand "Visual Studio compiler PATH configuration"
-    
-    Write-Host "Visual Studio compiler added to conda environment PATH" -ForegroundColor Green
-    Write-Host "The compiler will be automatically available when you activate the environment" -ForegroundColor Green
-    
-    # Reactivate environment to pick up the new PATH
-    Write-Host "Reactivating environment to apply PATH changes..." -ForegroundColor Yellow
-    conda deactivate
-    conda activate $CondaEnv
-    Check-LastCommand "Environment reactivation"
-    
+    # Remove PATH from conda env vars if it was set by a previous run (avoids overwriting user PATH)
+    conda env config vars unset -n $CondaEnv PATH 2>$null
+
+    # Use activate.d to prepend VS path only (does not overwrite system PATH)
+    $activateDir = Join-Path $env:CONDA_PREFIX "etc\conda\activate.d"
+    $activateScript = Join-Path $activateDir "vs_compiler_path.bat"
+    New-Item -ItemType Directory -Path $activateDir -Force | Out-Null
+    # Batch script: prepend VS path to existing PATH (use concatenation to avoid PowerShell parsing semicolon/quotes)
+    $batchLine = 'set "PATH=' + $vsCompilerPath + ';%PATH%"'
+    Set-Content -Path $activateScript -Value "@echo off`n$batchLine" -Encoding ASCII
+    Write-Host "Created activate hook: $activateScript" -ForegroundColor Green
+    Write-Host "Visual Studio compiler will be prepended to PATH when you activate the environment (your PATH is preserved)" -ForegroundColor Green
+
+    # Apply for current session
+    $env:PATH = "$vsCompilerPath;$env:PATH"
+
     # Verify the compiler is now accessible
     Write-Host "Verifying compiler accessibility..." -ForegroundColor Yellow
     $clTest = Get-Command cl.exe -ErrorAction SilentlyContinue
@@ -150,6 +160,20 @@ Write-Host "Initializing Git submodules..." -ForegroundColor Yellow
 git submodule update --init --recursive
 Check-LastCommand "Git submodules initialization"
 
+# Build backend required by some deps (e.g. polyscope); must be installed before requirements when using --no-build-isolation
+Write-Host "Installing scikit-build-core (build backend for native packages)..." -ForegroundColor Yellow
+pip install scikit-build-core
+Check-LastCommand "scikit-build-core installation"
+
+# Install libigl (optional: only needed for Playground mesh .obj/.glb loading; not needed for PLY->USDZ)
+Write-Host "Installing libigl (optional, prebuilt wheel only)..." -ForegroundColor Yellow
+$libiglOk = $true
+pip install libigl --only-binary=libigl 2>&1 | Out-Host
+if ($LASTEXITCODE -ne 0) {
+    $libiglOk = $false
+    Write-Host "Skipped: libigl (optional). Install later if needed: pip install libigl" -ForegroundColor Yellow
+}
+
 # Install Python dependencies
 Write-Host "Installing Python requirements from requirements.txt..." -ForegroundColor Yellow
 pip install --no-build-isolation -r requirements.txt
@@ -180,6 +204,9 @@ Write-Host "=================================================" -ForegroundColor 
 Write-Host "    INSTALLATION COMPLETED SUCCESSFULLY!" -ForegroundColor Green
 Write-Host "=================================================" -ForegroundColor Green
 Write-Host "Environment '$CondaEnv' is ready with all dependencies!" -ForegroundColor Green
+if (-not $libiglOk) {
+    Write-Host "Note: libigl was skipped (optional; only needed for Playground .obj/.glb mesh loading)." -ForegroundColor Cyan
+}
 Write-Host ""
 Write-Host "To use the environment:" -ForegroundColor Cyan
 Write-Host "  conda activate $CondaEnv" -ForegroundColor White
