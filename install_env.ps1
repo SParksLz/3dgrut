@@ -405,10 +405,10 @@ Write-Host "Initializing Git submodules..." -ForegroundColor Yellow
 git submodule update --init --recursive
 Check-LastCommand "Git submodules initialization"
 
-# Build backend required by some deps (e.g. polyscope); must be installed before requirements when using --no-build-isolation
-Write-Host "Installing scikit-build-core (build backend for native packages)..." -ForegroundColor Yellow
-pip install scikit-build-core
-Check-LastCommand "scikit-build-core installation"
+# Build backends required by native packages built without isolation on Windows.
+Write-Host "Installing native build backends (scikit-build-core, nanobind)..." -ForegroundColor Yellow
+pip install scikit-build-core nanobind
+Check-LastCommand "Native build backend installation"
 
 # Install libigl (optional: only needed for Playground mesh .obj/.glb loading; not needed for PLY->USDZ)
 Write-Host "Installing libigl (optional, prebuilt wheel only)..." -ForegroundColor Yellow
