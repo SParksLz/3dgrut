@@ -2,7 +2,8 @@
 # .\install_env.ps1
 
 param (
-    [string]$CondaEnv = "3dgrut"
+    [string]$CondaEnv = "3dgrut",
+    [string]$CudaVersion = "auto"
 )
 
 # Function to check if last command succeeded
@@ -56,6 +57,163 @@ function Find-VisualStudioCompiler {
     return $null
 }
 
+function Normalize-CudaVersion {
+    param([string]$RequestedVersion)
+
+    if (-not $RequestedVersion) {
+        return "auto"
+    }
+
+    switch -Regex ($RequestedVersion.Trim().ToLowerInvariant()) {
+        "^auto$" { return "auto" }
+        "^12\.4(\.0)?$" { return "12.4.0" }
+        "^12\.8(\.1)?$" { return "12.8.1" }
+        default {
+            throw "Unsupported CUDA version '$RequestedVersion'. Supported values are auto, 12.4.0, and 12.8.1."
+        }
+    }
+}
+
+function Get-DetectedCudaArchCodes {
+    Write-Host "Detecting NVIDIA GPU compute capability..." -ForegroundColor Yellow
+
+    $archCodes = @()
+
+    try {
+        $computeCaps = & nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>$null
+        if ($LASTEXITCODE -eq 0 -and $computeCaps) {
+            foreach ($cap in $computeCaps) {
+                $capText = $cap.ToString().Trim()
+                if ($capText -match "^(?<major>\d+)(?:\.(?<minor>\d+))?$") {
+                    $major = [int]$Matches["major"]
+                    $minor = if ($Matches["minor"]) { [int]$Matches["minor"] } else { 0 }
+                    $archCodes += ($major * 10 + $minor)
+                }
+            }
+        }
+    } catch {}
+
+    if (-not $archCodes) {
+        try {
+            $gpuNames = & nvidia-smi --query-gpu=name --format=csv,noheader 2>$null
+            if ($LASTEXITCODE -eq 0 -and $gpuNames) {
+                foreach ($gpuName in $gpuNames) {
+                    $gpuNameText = $gpuName.ToString().Trim()
+                    if ($gpuNameText -match "Blackwell|RTX\s*50\d{2}|RTX\s*PRO\s*6000.*Blackwell") {
+                        $archCodes += 120
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    $archCodes = @($archCodes | Sort-Object -Unique)
+    if ($archCodes.Count -gt 0) {
+        Write-Host ("Detected CUDA architectures: " + ($archCodes -join ", ")) -ForegroundColor Green
+    } else {
+        Write-Host "Warning: Could not detect GPU compute capability from nvidia-smi; defaulting to the legacy CUDA profile." -ForegroundColor Yellow
+    }
+
+    return $archCodes
+}
+
+function Resolve-CudaInstallProfile {
+    param([string]$RequestedVersion)
+
+    $normalizedVersion = Normalize-CudaVersion $RequestedVersion
+    $detectedArchCodes = Get-DetectedCudaArchCodes
+    $selectionReason = $null
+
+    if ($normalizedVersion -eq "auto") {
+        if ($detectedArchCodes.Count -gt 0 -and ($detectedArchCodes | Measure-Object -Maximum).Maximum -ge 100) {
+            $normalizedVersion = "12.8.1"
+            $selectionReason = "Detected compute capability 10.0+ GPU; selecting the Blackwell-capable CUDA 12.8.1 profile."
+        } else {
+            $normalizedVersion = "12.4.0"
+            $selectionReason = "Detected pre-Blackwell GPU (or no GPU info); selecting the legacy-compatible CUDA 12.4.0 profile."
+        }
+    } else {
+        $selectionReason = "Using user-requested CUDA version $normalizedVersion."
+    }
+
+    switch ($normalizedVersion) {
+        "12.4.0" {
+            $torchPackages = @(
+                "install",
+                "torch==2.5.1",
+                "torchvision==0.20.1",
+                "torchaudio==2.5.1",
+                "--index-url",
+                "https://download.pytorch.org/whl/cu124"
+            )
+            $profile = @{
+                CudaVersion = "12.4.0"
+                CudaLabel = "12.4"
+                CondaChannel = "nvidia/label/cuda-12.4.0"
+                TorchPackages = $torchPackages
+                TorchCudaArchList = "7.0;7.5;8.0;8.6;8.9;9.0+PTX"
+                KaolinWheelUrl = "https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.5.1_cu124/kaolin-0.17.0-cp311-cp311-win_amd64.whl"
+            }
+        }
+        "12.8.1" {
+            $torchPackages = @(
+                "install",
+                "torch",
+                "torchvision",
+                "torchaudio",
+                "--index-url",
+                "https://download.pytorch.org/whl/cu128"
+            )
+            $profile = @{
+                CudaVersion = "12.8.1"
+                CudaLabel = "12.8.1"
+                CondaChannel = "nvidia/label/cuda-12.8.1"
+                TorchPackages = $torchPackages
+                TorchCudaArchList = "7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX"
+                KaolinWheelUrl = $null
+            }
+        }
+    }
+
+    if ($detectedArchCodes.Count -gt 0) {
+        $maxSupportedArch = if ($normalizedVersion -eq "12.8.1") { 120 } else { 90 }
+        $tcnnArchCodes = @(
+            $detectedArchCodes |
+            Where-Object { $_ -ge 50 -and $_ -le $maxSupportedArch } |
+            Sort-Object -Unique
+        )
+        if ($tcnnArchCodes.Count -eq 0) {
+            $tcnnArchCodes = @($maxSupportedArch)
+        }
+        $profile["TcnnCudaArchitectures"] = ($tcnnArchCodes -join ";")
+    } else {
+        $profile["TcnnCudaArchitectures"] = if ($normalizedVersion -eq "12.8.1") { "120" } else { "90" }
+    }
+
+    $profile["SelectionReason"] = $selectionReason
+    $profile["DetectedArchCodes"] = $detectedArchCodes
+    return $profile
+}
+
+function Apply-CudaEnvironmentHints {
+    param(
+        [string]$EnvName,
+        [hashtable]$Profile
+    )
+
+    if ($Profile.TorchCudaArchList) {
+        conda env config vars set -n $EnvName TORCH_CUDA_ARCH_LIST="$($Profile.TorchCudaArchList)" | Out-Null
+        $env:TORCH_CUDA_ARCH_LIST = $Profile.TorchCudaArchList
+        Write-Host "Configured TORCH_CUDA_ARCH_LIST=$($Profile.TorchCudaArchList)" -ForegroundColor Green
+    }
+
+    if ($Profile.TcnnCudaArchitectures) {
+        conda env config vars set -n $EnvName TCNN_CUDA_ARCHITECTURES="$($Profile.TcnnCudaArchitectures)" | Out-Null
+        $env:TCNN_CUDA_ARCHITECTURES = $Profile.TcnnCudaArchitectures
+        Write-Host "Configured TCNN_CUDA_ARCHITECTURES=$($Profile.TcnnCudaArchitectures)" -ForegroundColor Green
+    }
+}
+
 Write-Host "`nStarting Conda environment setup: $CondaEnv"
 
 # Initialize conda for PowerShell (this enables conda commands)
@@ -101,6 +259,11 @@ if ($CurrentEnv -ne $CondaEnv) {
 }
 Write-Host "Current environment: $CurrentEnv" -ForegroundColor Green
 
+$cudaProfile = Resolve-CudaInstallProfile $CudaVersion
+Write-Host ("Selected CUDA profile: " + $cudaProfile.CudaVersion) -ForegroundColor Green
+Write-Host $cudaProfile.SelectionReason -ForegroundColor Cyan
+Apply-CudaEnvironmentHints -EnvName $CondaEnv -Profile $cudaProfile
+
 # Configure Visual Studio C++ compiler for PyTorch JIT compilation
 # Use activate.d hook to PREPEND VS path to PATH (preserves your existing PATH)
 Write-Host "`nConfiguring Visual Studio C++ compiler for conda environment..." -ForegroundColor Yellow
@@ -135,14 +298,14 @@ if ($vsCompilerPath) {
     Write-Host "You may need to install Visual Studio Build Tools and re-run this script" -ForegroundColor Yellow
 }
 
-# Install CUDA toolkit 12.4 (nvcc, headers, libs)
-Write-Host "`nInstalling CUDA toolkit 12.4 (nvcc, etc.)..." -ForegroundColor Yellow
-conda install -y -c nvidia/label/cuda-12.4.0 cuda-toolkit
+# Install CUDA toolkit (nvcc, headers, libs)
+Write-Host "`nInstalling CUDA toolkit $($cudaProfile.CudaLabel) (nvcc, etc.)..." -ForegroundColor Yellow
+conda install -y -c $cudaProfile.CondaChannel cuda-toolkit
 Check-LastCommand "CUDA toolkit installation"
 
 # Install PyTorch with CUDA support (CRITICAL: This must complete first)
-Write-Host "`nInstalling PyTorch + CUDA 12.4 (this may take several minutes)..." -ForegroundColor Yellow
-pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+Write-Host "`nInstalling PyTorch + CUDA $($cudaProfile.CudaLabel) (this may take several minutes)..." -ForegroundColor Yellow
+& pip @($cudaProfile.TorchPackages)
 Check-LastCommand "PyTorch installation"
 
 # Verify PyTorch installation
@@ -152,7 +315,7 @@ Check-LastCommand "PyTorch verification"
 
 # Install build tools
 Write-Host "Installing build tools (cmake, ninja)..." -ForegroundColor Yellow
-conda install -y cmake ninja -c nvidia/label/cuda-12.4.0
+conda install -y cmake ninja -c $cudaProfile.CondaChannel
 Check-LastCommand "Build tools installation"
 
 # Initialize Git submodules
@@ -189,9 +352,15 @@ pip install hydra-core
 Check-LastCommand "Hydra-core installation"
 
 # Install Kaolin
-Write-Host "Installing Kaolin (this may take a while)..." -ForegroundColor Yellow
-pip install https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.5.1_cu124/kaolin-0.17.0-cp311-cp311-win_amd64.whl
-Check-LastCommand "Kaolin installation"
+$kaolinOk = $true
+if ($cudaProfile.KaolinWheelUrl) {
+    Write-Host "Installing Kaolin (this may take a while)..." -ForegroundColor Yellow
+    pip install $cudaProfile.KaolinWheelUrl
+    Check-LastCommand "Kaolin installation"
+} else {
+    $kaolinOk = $false
+    Write-Host "Skipping Kaolin install: no Windows CUDA $($cudaProfile.CudaLabel) wheel is configured yet." -ForegroundColor Yellow
+}
 
 # Install project in development mode
 Write-Host "Installing project in development mode..." -ForegroundColor Yellow
@@ -203,9 +372,12 @@ Write-Host "`n" -NoNewline
 Write-Host "=================================================" -ForegroundColor Green
 Write-Host "    INSTALLATION COMPLETED SUCCESSFULLY!" -ForegroundColor Green
 Write-Host "=================================================" -ForegroundColor Green
-Write-Host "Environment '$CondaEnv' is ready with all dependencies!" -ForegroundColor Green
+Write-Host "Environment '$CondaEnv' is ready with the CUDA $($cudaProfile.CudaVersion) profile." -ForegroundColor Green
 if (-not $libiglOk) {
     Write-Host "Note: libigl was skipped (optional; only needed for Playground .obj/.glb mesh loading)." -ForegroundColor Cyan
+}
+if (-not $kaolinOk) {
+    Write-Host "Note: Kaolin was skipped for CUDA $($cudaProfile.CudaVersion); add a compatible wheel or source-build path if your workflow needs it." -ForegroundColor Cyan
 }
 Write-Host ""
 Write-Host "To use the environment:" -ForegroundColor Cyan
