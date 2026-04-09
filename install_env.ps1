@@ -214,6 +214,86 @@ function Apply-CudaEnvironmentHints {
     }
 }
 
+function Configure-WindowsCudaToolchain {
+    param(
+        [string]$EnvName,
+        [hashtable]$Profile
+    )
+
+    $cudaRoot = Join-Path $env:CONDA_PREFIX "Library"
+    $cudaBin = Join-Path $cudaRoot "bin"
+    $cudaLib = Join-Path $cudaRoot "lib"
+    $cudaLibX64 = Join-Path $cudaLib "x64"
+    $cudaInclude = Join-Path $cudaRoot "include"
+    $cudaIncludeCrt = Join-Path $cudaInclude "crt"
+    $cudaIncludeTargets = Join-Path $cudaInclude "targets\x64"
+
+    $pathEntries = @($cudaBin) | Where-Object { Test-Path $_ }
+    $libEntries = @($cudaLibX64, $cudaLib) | Where-Object { Test-Path $_ }
+    $includeEntries = @($cudaInclude, $cudaIncludeCrt, $cudaIncludeTargets) | Where-Object { Test-Path $_ }
+
+    if (-not (Test-Path $cudaRoot)) {
+        Write-Host "Warning: CUDA root '$cudaRoot' was not found after installation." -ForegroundColor Yellow
+        return
+    }
+
+    conda env config vars set -n $EnvName CUDA_HOME="$cudaRoot" CUDA_PATH="$cudaRoot" | Out-Null
+    $env:CUDA_HOME = $cudaRoot
+    $env:CUDA_PATH = $cudaRoot
+
+    $versionTokens = $Profile.CudaVersion.Split(".")
+    if ($versionTokens.Count -ge 2) {
+        $majorMinor = "$($versionTokens[0])_$($versionTokens[1])"
+        Set-Item -Path ("Env:CUDA_PATH_V$majorMinor") -Value $cudaRoot
+    }
+
+    if ($pathEntries.Count -gt 0) {
+        $env:PATH = (($pathEntries + @($env:PATH)) -join ";")
+    }
+    if ($libEntries.Count -gt 0) {
+        $existingLib = if ($env:LIB) { @($env:LIB) } else { @() }
+        $env:LIB = (($libEntries + $existingLib) -join ";")
+    }
+    if ($includeEntries.Count -gt 0) {
+        $existingInclude = if ($env:INCLUDE) { @($env:INCLUDE) } else { @() }
+        $env:INCLUDE = (($includeEntries + $existingInclude) -join ";")
+    }
+
+    $activateDir = Join-Path $env:CONDA_PREFIX "etc\conda\activate.d"
+    $activateScript = Join-Path $activateDir "cuda_toolchain_paths.bat"
+    New-Item -ItemType Directory -Path $activateDir -Force | Out-Null
+
+    $activateLines = @(
+        "@echo off",
+        "set ""CUDA_HOME=%CONDA_PREFIX%\Library""",
+        "set ""CUDA_PATH=%CONDA_PREFIX%\Library"""
+    )
+
+    if ($versionTokens.Count -ge 2) {
+        $activateLines += "set ""CUDA_PATH_V$majorMinor=%CONDA_PREFIX%\Library"""
+    }
+
+    $activateLines += @(
+        "if exist ""%CUDA_HOME%\bin"" set ""PATH=%CUDA_HOME%\bin;%PATH%""",
+        "if exist ""%CUDA_HOME%\lib\x64"" set ""LIB=%CUDA_HOME%\lib\x64;%LIB%""",
+        "if exist ""%CUDA_HOME%\lib"" set ""LIB=%CUDA_HOME%\lib;%LIB%""",
+        "if exist ""%CUDA_HOME%\include"" set ""INCLUDE=%CUDA_HOME%\include;%INCLUDE%""",
+        "if exist ""%CUDA_HOME%\include\crt"" set ""INCLUDE=%CUDA_HOME%\include\crt;%INCLUDE%""",
+        "if exist ""%CUDA_HOME%\include\targets\x64"" set ""INCLUDE=%CUDA_HOME%\include\targets\x64;%INCLUDE%"""
+    )
+
+    Set-Content -Path $activateScript -Value ($activateLines -join "`n") -Encoding ASCII
+
+    Write-Host "Configured CUDA_HOME/CUDA_PATH for conda environment." -ForegroundColor Green
+    if ($libEntries.Count -gt 0) {
+        Write-Host ("Configured CUDA LIB paths: " + ($libEntries -join "; ")) -ForegroundColor Green
+    }
+    if ($includeEntries.Count -gt 0) {
+        Write-Host ("Configured CUDA INCLUDE paths: " + ($includeEntries -join "; ")) -ForegroundColor Green
+    }
+    Write-Host "Created CUDA activate hook: $activateScript" -ForegroundColor Green
+}
+
 Write-Host "`nStarting Conda environment setup: $CondaEnv"
 
 # Initialize conda for PowerShell (this enables conda commands)
@@ -318,6 +398,8 @@ Write-Host "Installing build tools (cmake, ninja)..." -ForegroundColor Yellow
 conda install -y cmake ninja -c $cudaProfile.CondaChannel
 Check-LastCommand "Build tools installation"
 
+Configure-WindowsCudaToolchain -EnvName $CondaEnv -Profile $cudaProfile
+
 # Initialize Git submodules
 Write-Host "Initializing Git submodules..." -ForegroundColor Yellow
 git submodule update --init --recursive
@@ -339,7 +421,28 @@ if ($LASTEXITCODE -ne 0) {
 
 # Install Python dependencies
 Write-Host "Installing Python requirements from requirements.txt..." -ForegroundColor Yellow
-pip install --no-build-isolation -r requirements.txt
+$requirementsPath = Join-Path $PSScriptRoot "requirements.txt"
+$effectiveRequirementsPath = $requirementsPath
+$skippedPpisp = $false
+if ($IsWindows) {
+    $requirementsLines = Get-Content -Path $requirementsPath
+    $filteredRequirements = @()
+    foreach ($requirementsLine in $requirementsLines) {
+        if ($requirementsLine -match '^\s*ppisp\s*@') {
+            $skippedPpisp = $true
+            continue
+        }
+        $filteredRequirements += $requirementsLine
+    }
+
+    if ($skippedPpisp) {
+        $effectiveRequirementsPath = Join-Path $env:TEMP "3dgrut_requirements_windows_filtered.txt"
+        Set-Content -Path $effectiveRequirementsPath -Value $filteredRequirements -Encoding ASCII
+        Write-Host "Skipping optional ppisp dependency on Windows for the export-focused workflow." -ForegroundColor Yellow
+    }
+}
+
+pip install --no-build-isolation -r $effectiveRequirementsPath
 Check-LastCommand "Requirements installation"
 
 # Install additional dependencies
