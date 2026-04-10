@@ -16,6 +16,20 @@ function Check-LastCommand {
     Write-Host "$StepName completed successfully" -ForegroundColor Green
 }
 
+function Test-IsWindowsPlatform {
+    if ($env:OS -eq "Windows_NT") {
+        return $true
+    }
+
+    try {
+        return [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+            [System.Runtime.InteropServices.OSPlatform]::Windows
+        )
+    } catch {
+        return $false
+    }
+}
+
 # Function to find Visual Studio cl.exe path
 function Find-VisualStudioCompiler {
     Write-Host "Searching for Visual Studio C++ compiler..." -ForegroundColor Yellow
@@ -424,7 +438,7 @@ Write-Host "Installing Python requirements from requirements.txt..." -Foreground
 $requirementsPath = Join-Path $PSScriptRoot "requirements.txt"
 $effectiveRequirementsPath = $requirementsPath
 $skippedPpisp = $false
-if ($IsWindows) {
+if (Test-IsWindowsPlatform) {
     $requirementsLines = Get-Content -Path $requirementsPath
     $filteredRequirements = @()
     foreach ($requirementsLine in $requirementsLines) {
